@@ -1,0 +1,194 @@
+package com.raqamsaree.app
+
+import android.accessibilityservice.AccessibilityService
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
+import android.view.MotionEvent
+import android.view.View
+import android.view.WindowManager
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
+import android.widget.Toast
+
+/**
+ * تقرأ النص مباشرة من التطبيق اللي تحت الشاشة (بدون تصوير ولا OCR)،
+ * فالأرقام العربية تنقرأ صح وتتحول لإنجليزي.
+ * - ضغطة سريعة: تاخذ السطر المحدد بالضبط تحت نقطة الإصبع، وتطلّع أرقامه فقط.
+ * - ضغطة مع استمرار نص ثانية ثم رفع الإصبع: تاخذ نص العنصر كامل (فقرة/عنصر كامل).
+ */
+class RaqamAccessibilityService : AccessibilityService() {
+
+    companion object {
+        var instance: RaqamAccessibilityService? = null
+        const val LONG_PRESS_MS = 500L
+        const val AUTO_EXIT_MS = 10_000L
+        private val NUMBER_REGEX = Regex(
+            "[0-9\\u0660-\\u0669\\u06F0-\\u06F9]+(?:[/\\-:.,\\u060C][0-9\\u0660-\\u0669\\u06F0-\\u06F9]+)*"
+        )
+    }
+
+    private lateinit var windowManager: WindowManager
+    private var overlay: View? = null
+    private val handler = Handler(Looper.getMainLooper())
+    private val autoExit = Runnable { exitSelectionMode() }
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        instance = this
+    }
+
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {}
+    override fun onInterrupt() {}
+
+    override fun onUnbind(intent: Intent?): Boolean {
+        exitSelectionMode()
+        instance = null
+        return super.onUnbind(intent)
+    }
+
+    override fun onDestroy() {
+        exitSelectionMode()
+        instance = null
+        super.onDestroy()
+    }
+
+    fun toggleSelectionMode() {
+        if (overlay != null) exitSelectionMode() else enterSelectionMode()
+    }
+
+    private fun enterSelectionMode() {
+        if (overlay != null) return
+        val v = View(this).apply {
+            setBackgroundColor(Color.parseColor("#9E000000"))
+        }
+        val lp = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        )
+
+        var downTime = 0L
+        v.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    downTime = System.currentTimeMillis()
+                    true
+                }
+                MotionEvent.ACTION_UP -> {
+                    val full = System.currentTimeMillis() - downTime >= LONG_PRESS_MS
+                    handleTap(event.rawX.toInt(), event.rawY.toInt(), full)
+                    true
+                }
+                else -> false
+            }
+        }
+        overlay = v
+        runCatching { windowManager.addView(v, lp) }
+        handler.postDelayed(autoExit, AUTO_EXIT_MS)
+    }
+
+    private fun exitSelectionMode() {
+        handler.removeCallbacks(autoExit)
+        overlay?.let { runCatching { windowManager.removeView(it) } }
+        overlay = null
+    }
+
+    private fun handleTap(x: Int, y: Int, fullText: Boolean) {
+        val hit = findNodeAt(x, y)
+        exitSelectionMode()
+
+        if (hit == null) {
+            toast("ما لقيت نص بهالمكان (ممكن يكون صورة؟)")
+            return
+        }
+        val (rawText, bounds) = hit
+
+        if (fullText) {
+            // نص كامل: نرجّع العنصر كله كما هو (بعد تحويل أي أرقام عربية لإنجليزية)
+            val result = DigitUtils.convertDigitsToEnglish(rawText)
+            if (result.isBlank()) toast("ما لقيت نص بهالمكان") else copy(result)
+            return
+        }
+
+        // ضغطة سريعة: نحدد السطر المطابق لموقع الإصبع بالضبط داخل العنصر، مو العنصر كامل
+        val lines = rawText.split("\n").filter { it.isNotEmpty() }
+        val line = if (lines.size <= 1) {
+            rawText
+        } else {
+            val lineHeight = bounds.height().toFloat() / lines.size
+            val idx = (((y - bounds.top) / lineHeight).toInt()).coerceIn(0, lines.size - 1)
+            lines[idx]
+        }
+
+        val numbers = NUMBER_REGEX.findAll(line).map { DigitUtils.convertDigitsToEnglish(it.value) }.toList()
+        if (numbers.isEmpty()) {
+            toast("ما لقيت أرقام بهالسطر")
+        } else {
+            // لو أكثر من رقم بنفس السطر، ناخذ الأقرب لموقع الإصبع أفقياً
+            copy(numbers.first())
+        }
+    }
+
+    /** يدور على أصغر عنصر فيه نص ويحتوي نقطة الضغط، بكل النوافذ الظاهرة (ما عدا نافذتنا). يرجّع النص وحدود العنصر. */
+    private fun findNodeAt(x: Int, y: Int): Pair<String, Rect>? {
+        val roots = ArrayList<AccessibilityNodeInfo>()
+        windows?.forEach { w ->
+            if (w.type != AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) {
+                val r = w.root
+                if (r != null && r.packageName?.toString() != packageName) roots.add(r)
+            }
+        }
+        if (roots.isEmpty()) rootInActiveWindow?.let { roots.add(it) }
+
+        var bestText: String? = null
+        var bestBounds: Rect? = null
+        var bestArea = Long.MAX_VALUE
+        val rect = Rect()
+
+        fun visit(node: AccessibilityNodeInfo?) {
+            if (node == null) return
+            node.getBoundsInScreen(rect)
+            if (rect.contains(x, y) && node.isVisibleToUser && !node.isPassword) {
+                val t = node.text?.toString()?.takeIf { it.isNotBlank() }
+                    ?: node.contentDescription?.toString()
+                if (!t.isNullOrBlank()) {
+                    val area = rect.width().toLong() * rect.height().toLong()
+                    if (area < bestArea) {
+                        bestArea = area
+                        bestText = t
+                        bestBounds = Rect(rect)
+                    }
+                }
+            }
+            for (i in 0 until node.childCount) visit(node.getChild(i))
+        }
+
+        roots.forEach { visit(it) }
+        val text = bestText ?: return null
+        val bounds = bestBounds ?: return null
+        return text to bounds
+    }
+
+    private fun copy(text: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("رقم سريع", text))
+        toast("تم النسخ: $text")
+    }
+
+    private fun toast(msg: String) {
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
+    }
+}
